@@ -1,0 +1,642 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>silicon-entropy — RP2040 TRNG</title>
+  <style>
+    :root {
+      --bg: #ede3cd;
+      --bg-edge: #d3c3a3;
+      --dark: #1c1813;
+      --ink: #221e18;
+      --muted: #7c715e;
+      --pink: #e84a7f;
+      --sage: #5b8a67;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      min-height: 100vh;
+      background: radial-gradient(circle at 50% 45%, #f6efe0 0%, var(--bg) 56%, var(--bg-edge) 100%);
+      color: var(--ink);
+      font-family: ui-monospace, "SF Mono", "Cascadia Code", Consolas, monospace;
+      overflow: hidden;
+      transition: background 0.5s ease;
+      user-select: none;
+    }
+    body.inspecting {
+      background: var(--dark);
+    }
+
+    /* Top controls */
+    .hud {
+      position: fixed;
+      top: 18px;
+      left: 22px;
+      right: 22px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      z-index: 30;
+      pointer-events: none;
+      transition: opacity 0.35s ease;
+    }
+    body.inspecting .hud { opacity: 0.15; }
+    .hud-group {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      pointer-events: auto;
+      flex-wrap: wrap;
+    }
+    .brand-pill {
+      font-size: 0.74rem;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      font-weight: 700;
+      padding: 7px 13px;
+      background: rgba(255, 255, 255, 0.75);
+      backdrop-filter: blur(8px);
+      border: 1px solid rgba(30, 29, 26, 0.12);
+      border-radius: 999px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--muted); }
+    .dot.live { background: var(--sage); box-shadow: 0 0 6px var(--sage); }
+    .dot.raw { background: var(--pink); box-shadow: 0 0 6px var(--pink); }
+
+    button {
+      font-family: inherit;
+      font-size: 0.7rem;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      padding: 7px 13px;
+      border-radius: 999px;
+      border: 1px solid rgba(30, 29, 26, 0.15);
+      background: rgba(255, 255, 255, 0.78);
+      color: var(--ink);
+      cursor: pointer;
+      transition: all 0.18s ease;
+    }
+    button:hover:not(:disabled) { background: var(--ink); color: var(--bg); border-color: var(--ink); }
+    button:disabled { opacity: 0.35; cursor: not-allowed; }
+    button.primary { background: var(--ink); color: var(--bg); border-color: var(--ink); font-weight: 700; }
+    button.primary.connected { background: var(--pink); border-color: var(--pink); color: #fff; }
+    button.active { background: var(--sage); border-color: var(--sage); color: #fff; }
+    button.active.raw-mode { background: var(--pink); border-color: var(--pink); }
+
+    /* Desk stage */
+    .stage {
+      position: relative;
+      width: 100vw;
+      height: 100vh;
+      perspective: 1400px;
+    }
+
+    .stamp-wrap {
+      position: absolute;
+      left: 50%;
+      top: 50%;
+      cursor: pointer;
+      transition: transform 0.55s cubic-bezier(0.22, 1, 0.36, 1),
+                  filter 0.4s ease,
+                  opacity 0.4s ease;
+      will-change: transform, filter;
+    }
+
+    /* Scattered organic placement */
+    .stamp-wrap[data-pos="1"] { transform: translate(-115%, -44%) rotate(-9deg); z-index: 2; }
+    .stamp-wrap[data-pos="2"] { transform: translate(-48%, -56%) rotate(3deg);  z-index: 3; }
+    .stamp-wrap[data-pos="3"] { transform: translate(22%, -38%) rotate(11deg);  z-index: 1; }
+
+    /* Depth-of-field blur on non-hovered stamps (only on desk, never in darkroom) */
+    body:not(.inspecting) .stage:has(.stamp-wrap:hover) .stamp-wrap:not(:hover):not(.focused) {
+      filter: blur(4px) saturate(0.85);
+      opacity: 0.72;
+    }
+
+    .stamp-wrap:hover:not(.focused) {
+      z-index: 15;
+    }
+    .stamp-wrap[data-pos="1"]:hover:not(.focused) { transform: translate(-115%, -48%) rotate(-4deg) scale(1.06); }
+    .stamp-wrap[data-pos="2"]:hover:not(.focused) { transform: translate(-48%, -60%) rotate(0deg) scale(1.06); }
+    .stamp-wrap[data-pos="3"]:hover:not(.focused) { transform: translate(22%, -42%) rotate(6deg) scale(1.06); }
+
+    /* Floating dark pill label */
+    .stamp-tag {
+      position: absolute;
+      top: -32px;
+      left: 50%;
+      transform: translateX(-50%) translateY(6px);
+      background: #141311;
+      color: #f6f3eb;
+      font-size: 0.62rem;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      padding: 5px 11px;
+      border-radius: 999px;
+      white-space: nowrap;
+      opacity: 0;
+      pointer-events: none;
+      transition: all 0.22s ease;
+    }
+    .stamp-wrap:hover .stamp-tag {
+      opacity: 1;
+      transform: translateX(-50%) translateY(0);
+    }
+
+    /* Shadow wrapper + SVG-scalloped paper stamp */
+    .stamp-shadow {
+      filter: drop-shadow(var(--sx, 0px) var(--sy, 18px) 26px rgba(25, 21, 15, 0.22));
+      transition: filter 0.15s ease-out;
+    }
+    .stamp-wrap.focused .stamp-shadow {
+      filter: drop-shadow(var(--sx, 0px) var(--sy, 32px) 60px rgba(0, 0, 0, 0.68));
+    }
+
+    .stamp {
+      position: relative;
+      width: 260px;
+      height: 316px;
+      padding: 20px;
+      background: #f5eedf;
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+      overflow: hidden;
+      /* Clean SVG perforated stamp mask */
+      -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='260' height='316' viewBox='0 0 260 316'%3E%3Cdefs%3E%3Cmask id='m'%3E%3Crect width='260' height='316' fill='white'/%3E%3Cg fill='black'%3E%3Ccircle cx='10' cy='0' r='5.5'/%3E%3Ccircle cx='30' cy='0' r='5.5'/%3E%3Ccircle cx='50' cy='0' r='5.5'/%3E%3Ccircle cx='70' cy='0' r='5.5'/%3E%3Ccircle cx='90' cy='0' r='5.5'/%3E%3Ccircle cx='110' cy='0' r='5.5'/%3E%3Ccircle cx='130' cy='0' r='5.5'/%3E%3Ccircle cx='150' cy='0' r='5.5'/%3E%3Ccircle cx='170' cy='0' r='5.5'/%3E%3Ccircle cx='190' cy='0' r='5.5'/%3E%3Ccircle cx='210' cy='0' r='5.5'/%3E%3Ccircle cx='230' cy='0' r='5.5'/%3E%3Ccircle cx='250' cy='0' r='5.5'/%3E%3Ccircle cx='10' cy='316' r='5.5'/%3E%3Ccircle cx='30' cy='316' r='5.5'/%3E%3Ccircle cx='50' cy='316' r='5.5'/%3E%3Ccircle cx='70' cy='316' r='5.5'/%3E%3Ccircle cx='90' cy='316' r='5.5'/%3E%3Ccircle cx='110' cy='316' r='5.5'/%3E%3Ccircle cx='130' cy='316' r='5.5'/%3E%3Ccircle cx='150' cy='316' r='5.5'/%3E%3Ccircle cx='170' cy='316' r='5.5'/%3E%3Ccircle cx='190' cy='316' r='5.5'/%3E%3Ccircle cx='210' cy='316' r='5.5'/%3E%3Ccircle cx='230' cy='316' r='5.5'/%3E%3Ccircle cx='250' cy='316' r='5.5'/%3E%3Ccircle cx='0' cy='18' r='5.5'/%3E%3Ccircle cx='0' cy='38' r='5.5'/%3E%3Ccircle cx='0' cy='58' r='5.5'/%3E%3Ccircle cx='0' cy='78' r='5.5'/%3E%3Ccircle cx='0' cy='98' r='5.5'/%3E%3Ccircle cx='0' cy='118' r='5.5'/%3E%3Ccircle cx='0' cy='138' r='5.5'/%3E%3Ccircle cx='0' cy='158' r='5.5'/%3E%3Ccircle cx='0' cy='178' r='5.5'/%3E%3Ccircle cx='0' cy='198' r='5.5'/%3E%3Ccircle cx='0' cy='218' r='5.5'/%3E%3Ccircle cx='0' cy='238' r='5.5'/%3E%3Ccircle cx='0' cy='258' r='5.5'/%3E%3Ccircle cx='0' cy='278' r='5.5'/%3E%3Ccircle cx='0' cy='298' r='5.5'/%3E%3Ccircle cx='260' cy='18' r='5.5'/%3E%3Ccircle cx='260' cy='38' r='5.5'/%3E%3Ccircle cx='260' cy='58' r='5.5'/%3E%3Ccircle cx='260' cy='78' r='5.5'/%3E%3Ccircle cx='260' cy='98' r='5.5'/%3E%3Ccircle cx='260' cy='118' r='5.5'/%3E%3Ccircle cx='260' cy='138' r='5.5'/%3E%3Ccircle cx='260' cy='158' r='5.5'/%3E%3Ccircle cx='260' cy='178' r='5.5'/%3E%3Ccircle cx='260' cy='198' r='5.5'/%3E%3Ccircle cx='260' cy='218' r='5.5'/%3E%3Ccircle cx='260' cy='238' r='5.5'/%3E%3Ccircle cx='260' cy='258' r='5.5'/%3E%3Ccircle cx='260' cy='278' r='5.5'/%3E%3Ccircle cx='260' cy='298' r='5.5'/%3E%3C/g%3E%3C/mask%3E%3C/defs%3E%3Crect width='260' height='316' fill='white' mask='url(%23m)'/%3E%3C/svg%3E");
+      -webkit-mask-size: 100% 100%;
+      mask-size: 100% 100%;
+    }
+
+    /* Cotton paper grain + dual-angle sunlight glare */
+    .paper-grain {
+      position: absolute;
+      inset: 0;
+      pointer-events: none;
+      opacity: 0.22;
+      mix-blend-mode: multiply;
+      background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='140' height='140'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='140' height='140' filter='url(%23n)' opacity='0.55'/%3E%3C/svg%3E");
+    }
+    .sheen {
+      position: absolute;
+      inset: 0;
+      z-index: 5;
+      pointer-events: none;
+      background:
+        radial-gradient(
+          42% 85% at var(--mx, 50%) var(--my, 50%),
+          rgba(255, 252, 244, 0.34) 0%,
+          rgba(255, 250, 238, 0.11) 28%,
+          rgba(28, 22, 16, 0.08) 68%,
+          rgba(24, 18, 12, 0.16) 100%
+        );
+      transform: rotate(-18deg) scale(1.35);
+      opacity: 0;
+      transition: opacity 0.25s ease;
+    }
+    .postmark {
+      position: absolute;
+      right: 14px;
+      bottom: 36px;
+      width: 56px;
+      height: 56px;
+      border-radius: 50%;
+      border: 1.5px dashed rgba(232, 74, 127, 0.45);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      text-align: center;
+      font-size: 0.46rem;
+      line-height: 1.2;
+      letter-spacing: 0.06em;
+      color: rgba(232, 74, 127, 0.55);
+      transform: rotate(-16deg);
+      pointer-events: none;
+    }
+    .stamp-wrap:hover .sheen,
+    .stamp-wrap.focused .sheen { opacity: 1; }
+
+    .stamp-inner {
+      flex: 1;
+      border: 1px solid rgba(30, 29, 26, 0.13);
+      padding: 11px;
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+      background: linear-gradient(155deg, rgba(255,255,255,0.65), rgba(226,219,204,0.35));
+    }
+    .stamp-head {
+      display: flex;
+      justify-content: space-between;
+      font-size: 0.58rem;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--muted);
+      line-height: 1.35;
+    }
+    .stamp-foot {
+      display: flex;
+      justify-content: space-between;
+      font-size: 0.6rem;
+      letter-spacing: 0.08em;
+      color: var(--muted);
+      padding-top: 7px;
+      border-top: 1px dashed rgba(30, 29, 26, 0.15);
+    }
+
+    canvas.art {
+      width: 100%;
+      height: 185px;
+      display: block;
+      image-rendering: pixelated;
+      background: #e5dfd2;
+      border: 1px solid rgba(30, 29, 26, 0.08);
+    }
+
+    .metrics-body {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      padding: 6px 0;
+    }
+    .m-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: baseline;
+      border-bottom: 1px dotted rgba(30, 29, 26, 0.15);
+      padding-bottom: 5px;
+    }
+    .m-k { font-size: 0.62rem; color: var(--muted); letter-spacing: 0.06em; }
+    .m-v { font-size: 1rem; font-weight: 700; color: var(--ink); }
+
+    /* Darkroom Inspect state */
+    body.inspecting .stamp-wrap:not(.focused) {
+      opacity: 0 !important;
+      pointer-events: none;
+      filter: blur(8px);
+    }
+    .stamp-wrap.focused {
+      z-index: 50;
+      transform: translate(-50%, -50%) scale(1.38);
+    }
+    .stamp-wrap.focused .stamp-tag { opacity: 0 !important; }
+
+    .inspect-hint {
+      position: fixed;
+      bottom: 24px;
+      left: 50%;
+      transform: translateX(-50%);
+      font-size: 0.62rem;
+      letter-spacing: 0.14em;
+      text-transform: uppercase;
+      color: #8b8579;
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 0.35s ease;
+      z-index: 60;
+    }
+    body.inspecting .inspect-hint { opacity: 1; }
+  </style>
+</head>
+<body>
+  <header class="hud">
+    <div class="hud-group">
+      <div class="brand-pill">
+        <span id="dot" class="dot"></span>
+        <span>silicon-entropy</span>
+      </div>
+      <button id="btnConnect" class="primary">Connect Pico</button>
+    </div>
+    <div class="hud-group">
+      <button id="btnWhitened" class="active" disabled>SHA-256</button>
+      <button id="btnRaw" class="raw-mode" disabled>Raw</button>
+      <button id="btnPng" disabled>Save PNG</button>
+      <button id="btnBin" disabled>.BIN</button>
+      <button id="btnBoot" disabled>UF2</button>
+    </div>
+  </header>
+
+  <main class="stage">
+    <div class="stamp-wrap" data-pos="1">
+      <div class="stamp-tag">NOISE MATRIX // 256×256</div>
+      <div class="stamp-shadow">
+        <div class="stamp">
+          <div class="paper-grain"></div>
+          <div class="sheen"></div>
+          <div class="postmark">RP2040<br/>TRNG<br/>0x4006</div>
+          <div class="stamp-inner">
+            <div class="stamp-head">
+              <span>SPECIMEN 01<br/>RP2040 SILICON</span>
+              <span id="lblMode">IDLE</span>
+            </div>
+            <canvas id="noiseCanvas" class="art" width="256" height="256"></canvas>
+            <div class="stamp-foot">
+              <span>0x4006001C</span>
+              <span id="footEnt">— b/B</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="stamp-wrap" data-pos="2">
+      <div class="stamp-tag">BYTE SPECTRUM // 00–FF</div>
+      <div class="stamp-shadow">
+        <div class="stamp">
+          <div class="paper-grain"></div>
+          <div class="sheen"></div>
+          <div class="postmark">RP2040<br/>TRNG<br/>0x4006</div>
+          <div class="stamp-inner">
+            <div class="stamp-head">
+              <span>SPECIMEN 02<br/>DISTRIBUTION</span>
+              <span>64 KB</span>
+            </div>
+            <canvas id="histCanvas" class="art" width="256" height="185"></canvas>
+            <div class="stamp-foot">
+              <span>CHI-SQUARE</span>
+              <span id="footChi">—</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="stamp-wrap" data-pos="3">
+      <div class="stamp-tag">NIST SP 800-90B // TELEMETRY</div>
+      <div class="stamp-shadow">
+        <div class="stamp">
+          <div class="paper-grain"></div>
+          <div class="sheen"></div>
+          <div class="postmark">RP2040<br/>TRNG<br/>0x4006</div>
+          <div class="stamp-inner">
+            <div class="stamp-head">
+              <span>SPECIMEN 03<br/>USB-C STREAM</span>
+              <span>DUAL CORE</span>
+            </div>
+            <div class="metrics-body">
+              <div class="m-row"><span class="m-k">ENTROPY</span><span class="m-v" id="valEntropy">—</span></div>
+              <div class="m-row"><span class="m-k">1S BIAS</span><span class="m-v" id="valBias">—</span></div>
+              <div class="m-row"><span class="m-k">CHI²</span><span class="m-v" id="valChi2">—</span></div>
+              <div class="m-row"><span class="m-k">RATE</span><span class="m-v" id="valSpeed">—</span></div>
+            </div>
+            <div class="stamp-foot">
+              <span id="valTotal">0 KB</span>
+              <span>01/2026</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </main>
+
+  <div class="inspect-hint">CLICK ANYWHERE OR PRESS ESC</div>
+
+  <script>
+    const BUF_SIZE = 65536;
+    const ring = new Uint8Array(BUF_SIZE);
+    let writePos = 0, filled = 0, totalBytes = 0, bytesSinceTick = 0;
+    let lastTick = performance.now(), mode = "whitened";
+    let port = null, reader = null, writer = null, keepReading = false;
+
+    const $ = (id) => document.getElementById(id);
+    const dot = $("dot"), btnConnect = $("btnConnect"), btnWhitened = $("btnWhitened"),
+          btnRaw = $("btnRaw"), btnPng = $("btnPng"), btnBin = $("btnBin"), btnBoot = $("btnBoot");
+    const noiseCtx = $("noiseCanvas").getContext("2d");
+    const noiseImg = noiseCtx.createImageData(256, 256);
+    const histCtx = $("histCanvas").getContext("2d");
+
+    let focusedWrap = null;
+    const basePos = {
+      "1": { x: "-115%", y: "-44%", r: -9 },
+      "2": { x: "-48%",  y: "-56%", r: 3  },
+      "3": { x: "22%",   y: "-38%", r: 11 },
+    };
+
+    document.querySelectorAll(".stamp-wrap").forEach((wrap) => {
+      wrap.addEventListener("click", (e) => {
+        e.stopPropagation();
+        if (focusedWrap === wrap) {
+          closeInspect();
+        } else {
+          if (focusedWrap) {
+            focusedWrap.classList.remove("focused");
+            focusedWrap.style.transform = "";
+          }
+          focusedWrap = wrap;
+          wrap.classList.add("focused");
+          wrap.style.transform = "translate(-50%, -50%) scale(1.38)";
+          document.body.classList.add("inspecting");
+        }
+      });
+      wrap.addEventListener("mousemove", (e) => {
+        const rect = wrap.getBoundingClientRect();
+        const nx = (e.clientX - rect.left) / rect.width;
+        const ny = (e.clientY - rect.top) / rect.height;
+        wrap.style.setProperty("--mx", (nx * 100).toFixed(1) + "%");
+        wrap.style.setProperty("--my", (ny * 100).toFixed(1) + "%");
+
+        const rx = (ny - 0.5) * -16;
+        const ry = (nx - 0.5) * 16;
+        wrap.style.setProperty("--sx", (-ry * 1.3).toFixed(1) + "px");
+        wrap.style.setProperty("--sy", (18 + rx * 1.1).toFixed(1) + "px");
+        if (focusedWrap === wrap) {
+          wrap.style.transform = `translate(-50%, -50%) scale(1.38) rotateX(${rx}deg) rotateY(${ry}deg)`;
+        } else if (!focusedWrap) {
+          const p = basePos[wrap.dataset.pos];
+          wrap.style.transition = "transform 0.08s ease-out, filter 0.4s ease, opacity 0.4s ease";
+          wrap.style.transform = `translate(${p.x}, ${p.y}) rotate(${p.r * 0.35}deg) scale(1.06) rotateX(${rx}deg) rotateY(${ry}deg)`;
+        }
+      });
+      wrap.addEventListener("mouseleave", () => {
+        if (focusedWrap !== wrap) {
+          wrap.style.transition = "";
+          wrap.style.transform = "";
+          wrap.style.removeProperty("--sx");
+          wrap.style.removeProperty("--sy");
+        }
+      });
+    });
+
+    function closeInspect() {
+      if (focusedWrap) {
+        focusedWrap.classList.remove("focused");
+        focusedWrap.style.transform = "";
+        focusedWrap = null;
+      }
+      document.body.classList.remove("inspecting");
+    }
+
+    document.addEventListener("click", closeInspect);
+    document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeInspect(); });
+    document.addEventListener("mousemove", (e) => {
+      if (!focusedWrap) return;
+      const rx = ((e.clientY / window.innerHeight) - 0.5) * -14;
+      const ry = ((e.clientX / window.innerWidth) - 0.5) * 14;
+      focusedWrap.style.transform = `translate(-50%, -50%) scale(1.38) rotateX(${rx}deg) rotateY(${ry}deg)`;
+    });
+
+    function setConnected(ok) {
+      btnConnect.textContent = ok ? "Disconnect" : "Connect Pico";
+      btnConnect.classList.toggle("connected", ok);
+      [btnWhitened, btnRaw, btnPng, btnBin, btnBoot].forEach(b => b.disabled = !ok);
+      dot.className = "dot" + (ok ? (mode === "raw" ? " raw" : " live") : "");
+      $("lblMode").textContent = ok ? mode.toUpperCase() : "IDLE";
+    }
+
+    async function sendCmd(ch) {
+      if (writer) await writer.write(new TextEncoder().encode(ch));
+    }
+
+    btnConnect.addEventListener("click", async () => {
+      if (!("serial" in navigator)) return alert("Use Chrome, Edge, or Opera for Web Serial.");
+      if (port) {
+        keepReading = false;
+        try { if (reader) await reader.cancel(); } catch {}
+        try { if (writer) writer.releaseLock(); } catch {}
+        try { await port.close(); } catch {}
+        port = reader = writer = null;
+        setConnected(false);
+        return;
+      }
+      try {
+        port = await navigator.serial.requestPort();
+        await port.open({ baudRate: 115200 });
+        await port.setSignals({ dataTerminalReady: true });
+        writer = port.writable.getWriter();
+        await sendCmd("1");
+        await sendCmd("w");
+        mode = "whitened";
+        keepReading = true;
+        setConnected(true);
+        readLoop();
+      } catch (err) {
+        console.error(err);
+        if (err && err.name !== "NotFoundError") {
+          alert("Не удалось открыть порт: " + err.message + "\n(Проверь, не подключена ли Pico в другой вкладке)");
+        }
+        port = null;
+      }
+    });
+
+    btnWhitened.addEventListener("click", async () => {
+      mode = "whitened";
+      btnWhitened.classList.add("active");
+      btnRaw.classList.remove("active");
+      setConnected(true);
+      await sendCmd("w");
+    });
+
+    btnRaw.addEventListener("click", async () => {
+      mode = "raw";
+      btnRaw.classList.add("active");
+      btnWhitened.classList.remove("active");
+      setConnected(true);
+      await sendCmd("r");
+    });
+
+    btnBoot.addEventListener("click", () => sendCmd("u"));
+    btnPng.addEventListener("click", () => {
+      const a = document.createElement("a");
+      a.download = `silicon-entropy-${mode}.png`;
+      a.href = $("noiseCanvas").toDataURL("image/png");
+      a.click();
+    });
+    btnBin.addEventListener("click", () => {
+      const a = document.createElement("a");
+      a.download = `silicon-entropy-${mode}-64kb.bin`;
+      a.href = URL.createObjectURL(new Blob([ring], { type: "application/octet-stream" }));
+      a.click();
+    });
+
+    async function readLoop() {
+      while (port && port.readable && keepReading) {
+        reader = port.readable.getReader();
+        try {
+          while (keepReading) {
+            const { value, done } = await reader.read();
+            if (done) break;
+            if (value) {
+              for (let i = 0; i < value.length; i++) {
+                ring[writePos] = value[i];
+                writePos = (writePos + 1) & (BUF_SIZE - 1);
+              }
+              filled = Math.min(BUF_SIZE, filled + value.length);
+              totalBytes += value.length;
+              bytesSinceTick += value.length;
+            }
+          }
+        } catch (e) { console.error(e); }
+        finally { reader.releaseLock(); }
+      }
+    }
+
+    const popcnt = new Uint8Array(256);
+    for (let i = 0; i < 256; i++) {
+      let n = i, c = 0;
+      while (n) { c += n & 1; n >>= 1; }
+      popcnt[i] = c;
+    }
+
+    function renderFrame() {
+      const now = performance.now();
+      if (now - lastTick >= 120 && filled >= 1024) {
+        const dt = (now - lastTick) / 1000;
+        const kbps = (bytesSinceTick / 1024) / dt;
+        bytesSinceTick = 0;
+        lastTick = now;
+
+        const counts = new Uint32Array(256);
+        let ones = 0, n = filled;
+        const px = noiseImg.data;
+        for (let i = 0; i < n; i++) {
+          const b = ring[i];
+          counts[b]++;
+          ones += popcnt[b];
+          const p = i * 4;
+          px[p] = px[p + 1] = px[p + 2] = b;
+          px[p + 3] = 255;
+        }
+        noiseCtx.putImageData(noiseImg, 0, 0);
+
+        let entropy = 0, chi2 = 0, expected = n / 256, maxC = 1;
+        for (let i = 0; i < 256; i++) {
+          const c = counts[i];
+          if (c > maxC) maxC = c;
+          if (c > 0) { const p = c / n; entropy -= p * Math.log2(p); }
+          const d = c - expected;
+          chi2 += (d * d) / expected;
+        }
+
+        $("valEntropy").textContent = entropy.toFixed(4);
+        $("footEnt").textContent = entropy.toFixed(4) + " b/B";
+        $("valBias").textContent = ((ones / (n * 8)) * 100).toFixed(2) + "%";
+        $("valChi2").textContent = chi2.toFixed(1);
+        $("footChi").textContent = chi2.toFixed(1);
+        $("valSpeed").textContent = kbps.toFixed(1) + " KB/s";
+        $("valTotal").textContent = (totalBytes / 1024).toFixed(0) + " KB";
+
+        const w = histCtx.canvas.width, h = histCtx.canvas.height;
+        histCtx.fillStyle = "#ebe5d8";
+        histCtx.fillRect(0, 0, w, h);
+        histCtx.fillStyle = mode === "whitened" ? "#5b8a67" : "#e84a7f";
+        const barW = w / 256, scale = (h - 14) / Math.max(maxC, expected * 1.6);
+        for (let i = 0; i < 256; i++) {
+          const bh = counts[i] * scale;
+          histCtx.fillRect(i * barW, h - bh, Math.ceil(barW), bh);
+        }
+        const ey = h - expected * scale;
+        histCtx.strokeStyle = "rgba(30,29,26,0.35)";
+        histCtx.setLineDash([3, 3]);
+        histCtx.beginPath(); histCtx.moveTo(0, ey); histCtx.lineTo(w, ey); histCtx.stroke();
+        histCtx.setLineDash([]);
+      }
+      requestAnimationFrame(renderFrame);
+    }
+    requestAnimationFrame(renderFrame);
+  </script>
+</body>
+</html>
