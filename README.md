@@ -9,6 +9,8 @@ No soldering or external components required — runs on any Raspberry Pi Pico (
 
 **[Open Live WebSerial Visualizer](https://oyumly.github.io/silicon-entropy/web/)** *(Chrome, Edge, or Opera)*
 
+![silicon-entropy demo](assets/demo.gif)
+
 ## Architecture
 
 ```mermaid
@@ -76,6 +78,11 @@ Send single-byte commands over the USB CDC port (`115200` baud):
 | `p` | Toggle stream pause |
 | `s` | Print JSON health telemetry |
 | `u` | Reboot into `RPI-RP2` UF2 bootloader |
+
+## Future Ideas
+
+- [ ] DMA-paced `ROSC` sampling for higher USB throughput
+- [ ] Optional `ChaCha20` DRBG conditioning mode
 
 ## License
 
